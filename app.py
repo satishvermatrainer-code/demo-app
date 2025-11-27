@@ -1,4 +1,3 @@
-### FILE: app.py
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 import os
@@ -8,6 +7,8 @@ import time
 from motor.motor_asyncio import AsyncIOMotorClient
 from datetime import datetime
 from bson import ObjectId
+import ssl
+from pathlib import Path
 
 # ---------- Logging: single-line JSON logs per request ----------
 logger = logging.getLogger("demo_app")
@@ -19,52 +20,55 @@ logger.addHandler(handler)
 
 # ---------- Config (from env) ----------
 MONGO_URI = os.getenv("MONGO_URI")
-MONGO_DB = os.getenv("MONGO_DB", "app")
-MONGO_COLLECTION = os.getenv("MONGO_COLLECTION", "orders")
+MONGO_DB = os.getenv("mongoDb", "app")
+MONGO_COLLECTION = os.getenv("mongoCollection", "orders")
+MONGO_CA_FILE = os.getenv("MONGO_CA_FILE", "/etc/ssl/mongo/ca.pem")
 
 if not MONGO_URI:
-    # We do not raise here because in some test environments user may want to run without Mongo.
-    logger.warning(json.dumps({"level": "warning", "msg": "MONGO_URI not set; health checks will fail until provided"}))
+    logger.warning(json.dumps({"level": "warning", "msg": "MONGO_URI not set; health checks will fail"}))
 
 app = FastAPI()
 
-# Middleware to log every request as a single-line JSON
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    start = time.time()
-    try:
-        response = await call_next(request)
-        status_code = response.status_code
-    except Exception as exc:
-        status_code = 500
-        raise
-    finally:
-        latency_ms = int((time.time() - start) * 1000)
-        log = {
-            "method": request.method,
-            "path": request.url.path,
-            "status": status_code,
-            "latency_ms": latency_ms,
-            "ts": datetime.utcnow().isoformat() + "Z"
-        }
-        logger.info(json.dumps(log))
-    return response
-
-# ---------- Mongo client (motor) ----------
+# ---------- Mongo client (motor + TLS) ----------
 mongo_client: AsyncIOMotorClient | None = None
 
 @app.on_event("startup")
 async def startup_event():
     global mongo_client
-    if MONGO_URI:
-        mongo_client = AsyncIOMotorClient(MONGO_URI)
-        # Optional: set a short serverSelectionTimeoutMS to avoid hanging probes
-        try:
-            # test connection quickly
-            await mongo_client.admin.command("ping")
-            logger.info(json.dumps({"level": "info", "msg": "Connected to MongoDB"}))
-        except Exception as e:
-            logger.warning(json.dumps({"level": "warning", "msg": "Mongo connection failed at startup", "error": str(e)}))
+
+    tls_params = {}
+    ca_file_path = Path(MONGO_CA_FILE)
+
+    # Enable TLS if CA file exists
+    if ca_file_path.exists():
+        logger.info(json.dumps({
+            "msg": "TLS Enabled for MongoDB",
+            "ca_file": str(ca_file_path)
+        }))
+        tls_params = {
+            "tls": True,
+            "tlsCAFile": str(ca_file_path)
+        }
+    else:
+        logger.warning(json.dumps({
+            "msg": "TLS CA file not found, fallback to non-TLS",
+            "path": str(ca_file_path)
+        }))
+
+    mongo_client = AsyncIOMotorClient(
+        MONGO_URI,
+        serverSelectionTimeoutMS=3000,
+        **tls_params
+    )
+
+    try:
+        await mongo_client.admin.command("ping")
+        logger.info(json.dumps({"msg": "MongoDB connected successfully"}))
+    except Exception as e:
+        logger.error(json.dumps({
+            "msg": "Initial MongoDB connection failed",
+            "error": str(e)
+        }))
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -72,31 +76,28 @@ async def shutdown_event():
     if mongo_client:
         mongo_client.close()
 
-# ---------- Health endpoint ----------
+# ---------- Health ----------
 @app.get("/healthz")
-async def healthz():
-    """Return 200 when a fast Mongo ping succeeds, else 503."""
+async def health():
     if not mongo_client:
-        raise HTTPException(status_code=503, detail="no mongo client configured")
+        raise HTTPException(status_code=503, detail="Mongo client not configured")
     try:
         await mongo_client.admin.command("ping")
         return {"status": "ok"}
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"mongo ping failed: {e}")
+        raise HTTPException(status_code=503, detail=str(e))
 
-# ---------- Data model ----------
+# ---------- Data Model ----------
 class OrderIn(BaseModel):
     orderId: str
 
-# ---------- Helper: get collection ----------
+# ---------- Helpers ----------
 def get_collection():
     if not mongo_client:
-        raise HTTPException(status_code=503, detail="mongo not configured")
-    db = mongo_client[MONGO_DB]
-    coll = db[MONGO_COLLECTION]
-    return coll
+        raise HTTPException(status_code=503, detail="Mongo not configured")
+    return mongo_client[MONGO_DB][MONGO_COLLECTION]
 
-# ---------- POST /orders ----------
+# ---------- Endpoints ----------
 @app.post("/orders")
 async def create_order(order: OrderIn):
     coll = get_collection()
@@ -104,14 +105,12 @@ async def create_order(order: OrderIn):
     res = await coll.insert_one(doc)
     return {"inserted": True, "id": str(res.inserted_id)}
 
-# ---------- GET /orders/count ----------
 @app.get("/orders/count")
-async def orders_count():
+async def count_orders():
     coll = get_collection()
     count = await coll.count_documents({})
     return {"count": int(count)}
 
-# Optional readiness endpoint (alias)
 @app.get("/ready")
 async def ready():
-    return await healthz()
+    return await health()
