@@ -73,7 +73,7 @@ async def health():
         await mongo_client.admin.command("ping")
         return {"status": "ok"}
     except Exception as e:
-        raise HTTPException(status_code=503, detail=str(e)}
+        raise HTTPException(status_code=503, detail=str(e))
 
 @app.get("/ready")
 async def ready():
